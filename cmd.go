@@ -3,9 +3,29 @@ package cli
 import (
 	"bytes"
 	"context"
+	"github.com/rsb/failure"
 	flag "github.com/rsb/pflag"
+	"io"
+	"sort"
 	"strings"
 )
+
+// FParseErrWhitelist configures Flag parse errors to be ignored
+type FParseErrWhitelist flag.ParseErrorsWhitelist
+
+// ControlUsageFn is the function signature for the usage closure.
+type ControlUsageFn func(*Cmd) error
+
+// ControlFlagErrorFn is a function signature to allow user to control when
+// the parsing of a flag returns an error
+type ControlFlagErrorFn func(*Cmd, error) error
+
+// ControlHelpFn is a function signature to allow users to control help
+type ControlHelpFn func(*Cmd, []string)
+
+// GlobalNormalizeFlagFn defined the signature for the global normalization
+// function that can be used on every pflag set and children commands
+type GlobalNormalizeFlagFn func(f *flag.FlagSet, name string) flag.NormalizedName
 
 // Cmd represents a command on the command line. This command is heavily
 // influenced by Cobra cli. The goal of this project is to implement what
@@ -170,6 +190,145 @@ func (c *Cmd) Name() string {
 	return name
 }
 
+// Context returns underlying command context. If command was executed
+// with ExecuteContext or the context was set with SetContext, the
+// previously set context will be returned. Otherwise, nil is returned.
+//
+// Notice that a call to Execute and ExecuteC will replace a nil context of
+// a command with a context.Background, so a background context will be
+// returned by Context after one of these functions has been called.
+func (c *Cmd) Context() context.Context {
+	return c.ctx
+}
+
+// SetContext sets context for the command. It is set to context.Background by
+// default and will be overwritten by Command.ExecuteContext or
+// Command.ExecuteContextC
+func (c *Cmd) SetContext(ctx context.Context) {
+	c.ctx = ctx
+}
+
+// SetArgs sets arguments for the command. It is set to os.Args[1:] by default, if desired, can be overridden
+// particularly useful when testing.
+func (c *Cmd) SetArgs(a []string) {
+	c.args = a
+}
+
+// SetInputStream allows the input stream to be assigned to the command.
+func (c *Cmd) SetInputStream(in io.Reader) {
+	c.streams.SetIn(in)
+}
+
+// OutputStream returns the assign stdout
+func (c *Cmd) OutputStream() io.Writer {
+	return c.streams.Out()
+}
+
+// SetOutputStream allows the output stream to be assigned to the command.
+func (c *Cmd) SetOutputStream(out io.Writer) {
+	c.streams.SetOut(out)
+}
+
+// ErrorStream returns the assign stderr
+func (c *Cmd) ErrorStream() io.Writer {
+	return c.streams.Error()
+}
+
+// SetErrorStream allows the error stream to be assigned to the command.
+func (c *Cmd) SetErrorStream(e io.Writer) {
+	c.streams.SetError(e)
+}
+
+// SetUsageClosure assign user defined closure for usage
+func (c *Cmd) SetUsageClosure(fn ControlUsageFn) {
+	c.usage.Control = fn
+}
+
+// SetUsageTemplate allows the user to control the usage template.
+func (c *Cmd) SetUsageTemplate(s string) {
+	c.usage.Template = s
+}
+
+// Parent returns this commands parent command.
+func (c *Cmd) Parent() *Cmd {
+	return c.parent
+}
+
+// HasParent determines if the command is a child
+func (c *Cmd) HasParent() bool {
+	return c.parent != nil
+}
+
+// NameAndAliases returns a list of the command name and all aliases
+func (c *Cmd) NameAndAliases() string {
+	return strings.Join(append([]string{c.Name()}, c.Aliases...), ",")
+}
+
+// HasExample determines if the command has examples
+func (c *Cmd) HasExample() bool {
+	return len(c.Example) > 0
+}
+
+// HasSubCommands determines if the command has any child commands.
+func (c *Cmd) HasSubCommands() bool {
+	return len(c.commands) > 0
+}
+
+// Commands returns a sorted slice of child commands
+func (c *Cmd) Commands() []*Cmd {
+	if !c.isCommandsSorted() {
+		sort.Sort(sortByName(c.commands))
+		c.isSortedCmds = true
+	}
+	return c.commands
+}
+
+// ResetCommands delete parent, subcommands, and help command from this cmd.
+func (c *Cmd) ResetCommands() {
+	c.parent = nil
+	c.commands = nil
+	c.help.ClearDefault()
+	c.flags.ClearParentsGlobal()
+}
+
+// HasAlias determines if a given string is an alias of a command.
+func (c *Cmd) HasAlias(s string) bool {
+	for _, a := range c.Aliases {
+		if a == s {
+			return true
+		}
+	}
+	return false
+}
+
+// Path return the full path to this command.
+func (c *Cmd) Path() string {
+	if c.HasParent() {
+		return c.Parent().Path() + " " + c.Name()
+	}
+
+	return c.Name()
+}
+
+// Root finds the root command.
+func (c *Cmd) Root() *Cmd {
+	if c.HasParent() {
+		return c.Parent().Root()
+	}
+
+	return c
+}
+
+// VisitParents visits all parents of the command and invokes fn on each
+func (c *Cmd) VisitParents(fn func(*Cmd)) {
+	if !c.HasParent() {
+		return
+	}
+
+	fn(c.Parent())
+	c.Parent().VisitParents(fn)
+}
+
 // Flags returns the complete FlagSet that applies to this command
 // (local and global declared here by all parents)
 func (c *Cmd) Flags() *flag.FlagSet {
@@ -178,6 +337,138 @@ func (c *Cmd) Flags() *flag.FlagSet {
 	}
 
 	return c.flags.Full
+}
+
+// GlobalFlags returns the persistent FlagSet specifically set in the
+// current command
+func (c *Cmd) GlobalFlags() *flag.FlagSet {
+	if !c.flags.IsGlobal() {
+		c.flags.LoadGlobalSet(c.Name())
+	}
+
+	return c.flags.Global
+}
+
+// LocalSpecificFlags are flags specific to this command which will NOT
+// persist to subcommands.
+func (c *Cmd) LocalSpecificFlags() *flag.FlagSet {
+	return nil
+}
+
+// LocalFlags returns the local FlagSet specifically set in the current command.
+func (c *Cmd) LocalFlags() *flag.FlagSet {
+	return nil
+}
+
+func (c *Cmd) FlagErrorFn() ControlFlagErrorFn {
+	if c.flagErrorFn != nil {
+		return c.flagErrorFn
+	}
+
+	if c.HasParent() {
+		return c.parent.FlagErrorFn()
+	}
+
+	return func(c *Cmd, err error) error { return err }
+}
+
+// ParseFlags parses global and local flags
+func (c *Cmd) ParseFlags(args []string) error {
+	if c.DisableFlagParsing {
+		return nil
+	}
+
+	errorBuf := c.flags.LoadErrorBufferWhenEmpty()
+	beforeErrorLen := errorBuf.Len()
+
+	c.mergeGlobalFlags()
+
+	// do it here after merging all the flags and just before parse
+	c.Flags().ParseErrorsWhitelist = flag.ParseErrorsWhitelist(c.FParseErrWhitelist)
+
+	err := c.Flags().Parse(args)
+	// Print warnings if they occurred (e.g. deprecated flag messages).
+	if errorBuf.Len()-beforeErrorLen > 0 && err == nil {
+		// c.Print(errorBuf.String())
+	}
+	return err
+}
+
+func (c *Cmd) HasAvailableFlags() bool {
+	return c.Flags().HasAvailableFlags()
+}
+
+func (c *Cmd) UseLine() string {
+	line := c.Use
+	if c.HasParent() {
+		line = c.parent.Path() + " " + c.Use
+	}
+
+	if c.DisableFlagsInUseLine {
+		return line
+	}
+
+	if c.HasAvailableFlags() && !strings.Contains(line, "[flags]") {
+		line += " [flags]"
+	}
+
+	return line
+}
+
+// IsGlobalNormalizationEnabled determines if the closure is set
+func (c *Cmd) IsGlobalNormalizationEnabled() bool {
+	return c.flags.GlobalNormalizeFn != nil
+}
+
+// GlobalNormalization return the GlobalNormalizeFlagFn closure
+func (c *Cmd) GlobalNormalization() GlobalNormalizeFlagFn {
+	return c.flags.GlobalNormalizeFn
+}
+
+// SetGlobalNormalization assigns the closure to the command
+func (c *Cmd) SetGlobalNormalization(fn GlobalNormalizeFlagFn) {
+	c.flags.GlobalNormalizeFn = fn
+}
+
+// Add assigns on or more commands to this parent command
+// NOTE: this will panic if you try to add a command to itself
+func (c *Cmd) Add(cmds ...*Cmd) {
+	for i, x := range cmds {
+		if cmds[i] == c {
+			panic("[Add Failed] Command can't be a child of itself")
+		}
+
+		cmds[i].parent = c
+		c.updateMaxLengthFrom(x)
+		if c.IsGlobalNormalizationEnabled() {
+			x.SetGlobalNormalization(c.GlobalNormalization())
+		}
+
+		c.commands = append(c.commands, x)
+		c.markCommandsUnsorted()
+	}
+}
+
+// Remove removes one or more commands from the parent command.
+func (c *Cmd) Remove(cmds ...*Cmd) {
+	var commands []*Cmd
+
+MAIN:
+	for _, command := range c.commands {
+		for _, cmd := range cmds {
+			if command == cmd {
+				command.parent = nil
+				continue MAIN
+			}
+		}
+		commands = append(commands, command)
+	}
+
+	// recompute all lengths
+	c.resetMaxLengths()
+	for _, command := range c.commands {
+		c.updateMaxLengthFrom(command)
+	}
 }
 
 // mergeGlobalFlags merges c.flags.Global into c.flags.Full
@@ -207,43 +498,77 @@ func (c *Cmd) updateParentGlobalFlags() {
 	})
 }
 
-// Root finds the root command.
-func (c *Cmd) Root() *Cmd {
-	if c.HasParent() {
-		return c.Parent().Root()
+func (c *Cmd) isCommandsSorted() bool {
+	return c.isSortedCmds
+}
+
+func (c *Cmd) markCommandsSorted() {
+	c.isSortedCmds = true
+}
+
+func (c *Cmd) markCommandsUnsorted() {
+	c.isSortedCmds = false
+}
+
+func (c *Cmd) resetMaxLengths() {
+	c.maxLength.Reset()
+}
+
+func (c *Cmd) updateMaxLengthFrom(child *Cmd) {
+	usageLen := len(child.Use)
+	if usageLen > c.maxLength.Use {
+		c.maxLength.Use = usageLen
 	}
 
-	return c
-}
-
-// VisitParents visits all parents of the command and invokes fn on each
-func (c *Cmd) VisitParents(fn func(*Cmd)) {
-	if !c.HasParent() {
-		return
+	pathLen := len(child.Path())
+	if pathLen > c.maxLength.Path {
+		c.maxLength.Path = pathLen
 	}
 
-	fn(c.Parent())
-	c.Parent().VisitParents(fn)
+	nameLen := len(child.Name())
+	if nameLen > c.maxLength.Name {
+		c.maxLength.Name = nameLen
+	}
 }
 
-// Parent returns this commands parent command.
-func (c *Cmd) Parent() *Cmd {
-	return c.parent
-}
-
-// HasParent determines if the command is a child
-func (c *Cmd) HasParent() bool {
-	return c.parent != nil
-}
-
-// GlobalFlags returns the persistent FlagSet specifically set in the
-// current command
-func (c *Cmd) GlobalFlags() *flag.FlagSet {
-	if !c.flags.IsGlobal() {
-		c.flags.LoadGlobalSet(c.Name())
+func (c *Cmd) findNext(next string) *Cmd {
+	matches := make([]*Cmd, 0)
+	for _, cmd := range c.commands {
+		if cmd.Name() == next || cmd.HasAlias(next) {
+			cmd.calledAs.Name = next
+			return cmd
+		}
 	}
 
-	return c.flags.Global
+	if len(matches) == 1 {
+		return matches[0]
+	}
+
+	return nil
+}
+
+func (c *Cmd) validateRequiredFlags() error {
+	if c.DisableFlagParsing {
+		return nil
+	}
+
+	flags := c.Flags()
+	var missing []string
+	flags.VisitAll(func(pflag *flag.Flag) {
+		requiredAnnotation, found := pflag.Annotations[BashCompOneRequiredFlag]
+		if !found {
+			return
+		}
+		if (requiredAnnotation[0] == "true") && !pflag.Changed {
+			missing = append(missing, pflag.Name)
+		}
+	})
+
+	if len(missing) > 0 {
+		return failure.System(`required flag(s) "%s" not set`, strings.Join(missing, `","`))
+	}
+
+	return nil
 }
 
 // Usage allows the user to control the usage string in the cli
@@ -311,7 +636,7 @@ func (l *Lifecycle) IsRunnable() bool {
 	return l.Run != nil
 }
 
-// Flags hold all the various flag sets from `github.com/spf13/pflag`
+// Flags hold all the various flag sets from `github.com/rsb/pflag`
 type Flags struct {
 	ErrorBuf      *bytes.Buffer
 	Full          *flag.FlagSet
